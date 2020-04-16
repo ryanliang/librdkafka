@@ -190,6 +190,9 @@ void rd_kafka_cgrp_destroy_final (rd_kafka_cgrp_t *rkcg) {
         rd_list_destroy(&rkcg->rkcg_toppars);
         rd_list_destroy(rkcg->rkcg_subscribed_topics);
         rd_kafka_topic_partition_list_destroy(rkcg->rkcg_errored_topics);
+        if (rkcg->rkcg_assignor && rkcg->rkcg_assignor->rkas_destroy_state)
+                rkcg->rkcg_assignor->rkas_destroy_state(
+                        rkcg->rkcg_assignor_state);
         rd_free(rkcg);
 }
 
@@ -751,7 +754,7 @@ rd_kafka_rebalance_op (rd_kafka_cgrp_t *rkcg,
  */
 static void
 rd_kafka_cgrp_assignor_run (rd_kafka_cgrp_t *rkcg,
-                            const char *protocol_name,
+                            rd_kafka_assignor_t *rkas,
                             rd_kafka_resp_err_t err,
                             rd_kafka_metadata_t *metadata,
                             rd_kafka_group_member_t *members,
@@ -768,7 +771,7 @@ rd_kafka_cgrp_assignor_run (rd_kafka_cgrp_t *rkcg,
         *errstr = '\0';
 
         /* Run assignor */
-        err = rd_kafka_assignor_run(rkcg, protocol_name, metadata,
+        err = rd_kafka_assignor_run(rkcg, rkas, metadata,
                                     members, member_cnt,
                                     errstr, sizeof(errstr));
 
@@ -781,7 +784,9 @@ rd_kafka_cgrp_assignor_run (rd_kafka_cgrp_t *rkcg,
 
         rd_kafka_dbg(rkcg->rkcg_rk, CGRP|RD_KAFKA_DBG_CONSUMER, "ASSIGNOR",
                      "Group \"%s\": \"%s\" assignor run for %d member(s)",
-                     rkcg->rkcg_group_id->str, protocol_name, member_cnt);
+                     rkcg->rkcg_group_id->str,
+                     rkas->rkas_protocol_name->str,
+                     member_cnt);
 
         rd_kafka_cgrp_set_join_state(rkcg, RD_KAFKA_CGRP_JOIN_STATE_WAIT_SYNC);
 
@@ -800,7 +805,8 @@ err:
         rd_kafka_log(rkcg->rkcg_rk, LOG_ERR, "ASSIGNOR",
                      "Group \"%s\": failed to run assignor \"%s\" for "
                      "%d member(s): %s",
-                     rkcg->rkcg_group_id->str, protocol_name,
+                     rkcg->rkcg_group_id->str,
+                     rkas->rkas_protocol_name->str,
                      member_cnt, errstr);
 
         rd_kafka_cgrp_set_join_state(rkcg, RD_KAFKA_CGRP_JOIN_STATE_INIT);
@@ -824,7 +830,7 @@ rd_kafka_cgrp_assignor_handle_Metadata_op (rd_kafka_t *rk,
         if (rkcg->rkcg_join_state != RD_KAFKA_CGRP_JOIN_STATE_WAIT_METADATA)
                 return RD_KAFKA_OP_RES_HANDLED; /* From outdated state */
 
-        if (!rkcg->rkcg_group_leader.protocol) {
+        if (!rkcg->rkcg_group_leader.members) {
                 rd_kafka_dbg(rk, CGRP, "GRPLEADER",
                              "Group \"%.*s\": no longer leader: "
                              "not running assignor",
@@ -833,7 +839,7 @@ rd_kafka_cgrp_assignor_handle_Metadata_op (rd_kafka_t *rk,
         }
 
         rd_kafka_cgrp_assignor_run(rkcg,
-                                   rkcg->rkcg_group_leader.protocol,
+                                   rkcg->rkcg_assignor,
                                    rko->rko_err, rko->rko_u.metadata.md,
                                    rkcg->rkcg_group_leader.members,
                                    rkcg->rkcg_group_leader.member_cnt);
@@ -853,7 +859,6 @@ rd_kafka_cgrp_assignor_handle_Metadata_op (rd_kafka_t *rk,
 static int
 rd_kafka_group_MemberMetadata_consumer_read (
         rd_kafka_broker_t *rkb, rd_kafka_group_member_t *rkgm,
-        const rd_kafkap_str_t *GroupProtocol,
         const rd_kafkap_bytes_t *MemberMetadata) {
 
         rd_kafka_buf_t *rkbuf;
@@ -936,6 +941,7 @@ static void rd_kafka_cgrp_handle_JoinGroup (rd_kafka_t *rk,
         int32_t member_cnt;
         int actions;
         int i_am_leader = 0;
+        rd_kafka_assignor_t *rkas;
 
         if (err == RD_KAFKA_RESP_ERR__DESTROY)
                 return; /* Terminating */
@@ -969,6 +975,25 @@ static void rd_kafka_cgrp_handle_JoinGroup (rd_kafka_t *rk,
                  * a matching assignor so error out early. */
                 ErrorCode = RD_KAFKA_RESP_ERR__BAD_MSG;
         }
+	else if (!ErrorCode) {
+                char *protocol_name = RD_KAFKAP_STR_DUP(&Protocol);
+                if (!(rkas = rd_kafka_assignor_find(rkcg->rkcg_rk,
+                                                    protocol_name)) ||
+                    !rkas->rkas_enabled) {
+                        rd_kafka_dbg(rkb->rkb_rk, CGRP, "JOINGROUP",
+                                "Unsupported assignment strategy \"%s\"",
+                                protocol_name);
+                        if (rkcg->rkcg_assignor) {
+                                if (rkcg->rkcg_assignor->rkas_destroy_state)
+                                        rkcg->rkcg_assignor->rkas_destroy_state(
+                                                rkcg->rkcg_assignor_state);
+                                rkcg->rkcg_assignor_state = NULL;
+                                rkcg->rkcg_assignor = NULL;
+                        }
+                        ErrorCode = RD_KAFKA_RESP_ERR__UNKNOWN_PROTOCOL;
+                }
+                rd_free(protocol_name);
+	}
 
         rd_kafka_dbg(rkb->rkb_rk, CGRP, "JOINGROUP",
                      "JoinGroup response: GenerationId %"PRId32", "
@@ -992,6 +1017,14 @@ static void rd_kafka_cgrp_handle_JoinGroup (rd_kafka_t *rk,
                 rd_interval_backoff(&rkcg->rkcg_join_intvl, 1000*1000);
                 goto err;
         }
+
+        if (rkcg->rkcg_assignor && rkcg->rkcg_assignor != rkas) {
+                if (rkcg->rkcg_assignor->rkas_destroy_state)
+                        rkcg->rkcg_assignor->rkas_destroy_state(
+                                rkcg->rkcg_assignor_state);
+                rkcg->rkcg_assignor_state = NULL;
+        }
+        rkcg->rkcg_assignor = rkas;
 
         if (i_am_leader) {
                 rd_kafka_group_member_t *members;
@@ -1031,7 +1064,7 @@ static void rd_kafka_cgrp_handle_JoinGroup (rd_kafka_t *rk,
                         rd_list_init(&rkgm->rkgm_eligible, 0, NULL);
 
                         if (rd_kafka_group_MemberMetadata_consumer_read(
-                                    rkb, rkgm, &Protocol, &MemberMetadata)) {
+                                    rkb, rkgm, &MemberMetadata)) {
                                 /* Failed to parse this member's metadata,
                                  * ignore it. */
                         } else {
@@ -1053,7 +1086,6 @@ static void rd_kafka_cgrp_handle_JoinGroup (rd_kafka_t *rk,
                 rd_kafka_cgrp_group_leader_reset(rkcg,
                                                  "JoinGroup response clean-up");
 
-                rkcg->rkcg_group_leader.protocol = RD_KAFKAP_STR_DUP(&Protocol);
                 rd_kafka_assert(NULL, rkcg->rkcg_group_leader.members == NULL);
                 rkcg->rkcg_group_leader.members    = members;
                 rkcg->rkcg_group_leader.member_cnt = sub_cnt;
@@ -2691,10 +2723,6 @@ static void rd_kafka_cgrp_group_leader_reset (rd_kafka_cgrp_t *rkcg,
         rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "GRPLEADER",
                      "Group \"%.*s\": resetting group leader info: %s",
                      RD_KAFKAP_STR_PR(rkcg->rkcg_group_id), reason);
-        if (rkcg->rkcg_group_leader.protocol) {
-                rd_free(rkcg->rkcg_group_leader.protocol);
-                rkcg->rkcg_group_leader.protocol = NULL;
-        }
 
         if (rkcg->rkcg_group_leader.members) {
                 int i;
@@ -3646,7 +3674,6 @@ void rd_kafka_cgrp_handle_SyncGroup (rd_kafka_cgrp_t *rkcg,
         if (err)
                 goto err;
 
-
 	if (RD_KAFKAP_BYTES_LEN(member_state) == 0) {
 		/* Empty assignment. */
 		assignment = rd_kafka_topic_partition_list_new(0);
@@ -3695,6 +3722,17 @@ void rd_kafka_cgrp_handle_SyncGroup (rd_kafka_cgrp_t *rkcg,
  done:
         rd_kafka_cgrp_update_session_timeout(rkcg, rd_true/*reset timeout*/);
 
+        rd_assert(rkcg->rkcg_assignor);
+        if (rkcg->rkcg_assignor->rkas_on_assignment_cb) {
+                rd_kafka_consumer_group_metadata_t *cgmd =
+                        rd_kafka_consumer_group_metadata(rkcg->rkcg_rk);
+                rkcg->rkcg_assignor->rkas_on_assignment_cb(
+                        rkcg->rkcg_assignor,
+                        &(rkcg->rkcg_assignor_state),
+                        assignment, &UserData, cgmd);
+                rd_kafka_consumer_group_metadata_destroy(cgmd);
+        }
+
         /* Set the new assignment */
 	rd_kafka_cgrp_handle_assignment(rkcg, assignment);
 
@@ -3731,7 +3769,8 @@ void rd_kafka_cgrp_handle_SyncGroup (rd_kafka_cgrp_t *rkcg,
 
 
 rd_kafka_consumer_group_metadata_t *
-rd_kafka_consumer_group_metadata_new (const char *group_id) {
+rd_kafka_consumer_group_metadata_new (const char *group_id,
+                                      int32_t generation_id) {
         rd_kafka_consumer_group_metadata_t *cgmetadata;
 
         if (!group_id)
@@ -3739,17 +3778,25 @@ rd_kafka_consumer_group_metadata_new (const char *group_id) {
 
         cgmetadata = rd_calloc(1, sizeof(*cgmetadata));
         cgmetadata->group_id = rd_strdup(group_id);
+        cgmetadata->generation_id = generation_id;
 
         return cgmetadata;
 }
 
 rd_kafka_consumer_group_metadata_t *
 rd_kafka_consumer_group_metadata (rd_kafka_t *rk) {
+        int32_t generation_id = -1;
+
         if (rk->rk_type != RD_KAFKA_CONSUMER ||
             !rk->rk_conf.group_id_str)
                 return NULL;
 
-        return rd_kafka_consumer_group_metadata_new(rk->rk_conf.group_id_str);
+        if (rk->rk_cgrp)
+                generation_id = rk->rk_cgrp->rkcg_generation_id;
+
+        return rd_kafka_consumer_group_metadata_new(
+                rk->rk_conf.group_id_str,
+                generation_id);
 }
 
 void
@@ -3766,6 +3813,7 @@ rd_kafka_consumer_group_metadata_dup (
 
         ret = rd_calloc(1, sizeof(*cgmetadata));
         ret->group_id = rd_strdup(cgmetadata->group_id);
+        ret->generation_id = cgmetadata->generation_id;
 
         return ret;
 }
@@ -3776,7 +3824,7 @@ rd_kafka_consumer_group_metadata_dup (
  *  "CGMDv1:"<group_id>"\0"
  * Where <group_id> is the group_id string.
  */
-static const char rd_kafka_consumer_group_metadata_magic[7] = "CGMDv1:";
+static const char rd_kafka_consumer_group_metadata_magic[7] = "CGMDv2:";
 
 rd_kafka_error_t *rd_kafka_consumer_group_metadata_write (
         const rd_kafka_consumer_group_metadata_t *cgmd,
@@ -3786,12 +3834,16 @@ rd_kafka_error_t *rd_kafka_consumer_group_metadata_write (
         size_t of = 0;
         size_t magic_len = sizeof(rd_kafka_consumer_group_metadata_magic);
         size_t groupid_len = strlen(cgmd->group_id) + 1;
+        size_t generationid_len = sizeof(int32_t);
 
-        size = magic_len + groupid_len;
+        size = magic_len + groupid_len + generationid_len;
         buf = rd_malloc(size);
 
         memcpy(buf, rd_kafka_consumer_group_metadata_magic, magic_len);
         of += magic_len;
+
+        *(buf+of) = cgmd->generation_id;
+        of += sizeof(int32_t);
 
         memcpy(buf+of, cgmd->group_id, groupid_len);
 
@@ -3806,10 +3858,12 @@ rd_kafka_error_t *rd_kafka_consumer_group_metadata_read (
         rd_kafka_consumer_group_metadata_t **cgmdp,
         const void *buffer, size_t size) {
         size_t magic_len = sizeof(rd_kafka_consumer_group_metadata_magic);
+        size_t generationid_len = sizeof(int32_t);
         const char *buf = (const char *)buffer;
         const char *end = buf + size;
         const char *group_id;
         const char *s;
+        int32_t generation_id;
 
         if (size < magic_len + 1)
                 return rd_kafka_error_new(RD_KAFKA_RESP_ERR__BAD_MSG,
@@ -3821,7 +3875,9 @@ rd_kafka_error_t *rd_kafka_consumer_group_metadata_read (
                         "Input buffer is not a serialized "
                         "consumer group metadata object");
 
-        group_id = buf + magic_len;
+        generation_id = *(buf+magic_len);
+
+        group_id = buf + magic_len + generationid_len;
 
         /* Check that group_id is safe */
         for (s = group_id ; s < end - 1 ; s++) {
@@ -3836,8 +3892,8 @@ rd_kafka_error_t *rd_kafka_consumer_group_metadata_read (
                         RD_KAFKA_RESP_ERR__BAD_MSG,
                         "Input buffer has invalid stop byte");
 
-        /* We now know that group_id is printable-safe and is nul-terminated. */
-        *cgmdp = rd_kafka_consumer_group_metadata_new(group_id);
+        /* We now know that group_id is printable-safe and is null-terminated. */
+        *cgmdp = rd_kafka_consumer_group_metadata_new(group_id, generation_id);
 
         return NULL;
 }
@@ -3860,7 +3916,7 @@ static int unittest_consumer_group_metadata (void) {
                 size_t size, size2;
                 rd_kafka_error_t *error;
 
-                cgmd = rd_kafka_consumer_group_metadata_new(group_id);
+                cgmd = rd_kafka_consumer_group_metadata_new(group_id, 42);
                 RD_UT_ASSERT(cgmd != NULL, "failed to create metadata");
 
                 error = rd_kafka_consumer_group_metadata_write(cgmd, &buffer,
